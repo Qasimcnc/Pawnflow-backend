@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { Pool } = require('pg');
+const validators = require('./validators');
 
 const app = express();
 app.use(express.json());
@@ -286,64 +287,115 @@ app.get('/payment-history', async (req, res) => {
 
 // ---------------------------- CREATE LOAN ----------------------------
 app.post('/create-loan', async (req, res) => {
-  const {
-    customerName,
-    customerNumber,
-    email,
-    loanAmount,
-    interestRate,
-    collateralDescription,
-    customerNote,
-    loanIssuedDate,
-    loanTerm,
-    previousLoanAmount, // For the additional loan
-    userId, // User creating the loan (for shift tracking)
-  } = req.body;
-
   try {
+    // Map request body (handles both camelCase and snake_case)
+    const mapped = validators.mapRequestToDb(req.body);
+
+    // Extract fields
+    const {
+      first_name,
+      last_name,
+      email,
+      home_phone,
+      mobile_phone,
+      birthdate,
+      referral,
+      identification_info,
+      address,
+      customer_number,
+      loan_amount: loanAmount,
+      interest_rate: interestRate,
+      collateral_description,
+      customer_note,
+      loan_issued_date: loanIssuedDate,
+      loan_term: loanTerm,
+      previous_loan_amount: previousLoanAmount,
+      user_id: userId,
+    } = mapped;
+
+    // Validate required customer fields
+    const nameValidation = validators.validateNames(first_name, last_name);
+    if (!nameValidation.valid) {
+      return res.status(400).json({ message: nameValidation.error });
+    }
+
+    // Validate email if provided
+    if (email && !validators.isValidEmail(email)) {
+      return res.status(400).json({ message: 'Invalid email format' });
+    }
+
+    // Validate phone formats if provided
+    if (home_phone && !validators.isValidPhoneFormat(home_phone)) {
+      return res.status(400).json({ message: 'Invalid home_phone format' });
+    }
+    if (mobile_phone && !validators.isValidPhoneFormat(mobile_phone)) {
+      return res.status(400).json({ message: 'Invalid mobile_phone format' });
+    }
+
+    // Validate loan amounts
+    const amountValidation = validators.validateLoanAmounts(loanAmount, interestRate, loanTerm);
+    if (!amountValidation.valid) {
+      return res.status(400).json({ message: amountValidation.error });
+    }
+
+    // Calculate loan totals
     const totalLoanAmount = parseFloat(previousLoanAmount || 0) + parseFloat(loanAmount);
     const interestAmount = (totalLoanAmount * parseFloat(interestRate)) / 100;
     const totalPayableAmount = totalLoanAmount + interestAmount;
 
-    // Get current date and calculate due date (30 days from loanIssuedDate)
+    // Calculate due date
     const issued = new Date(loanIssuedDate);
     const due = new Date(issued);
-    due.setDate(due.getDate() + parseInt(loanTerm)); // Add loanTerm days to loanIssuedDate
+    due.setDate(due.getDate() + parseInt(loanTerm));
 
-    // Insert or update the loan record with new total loan amount and interest
+    // Insert loan with new customer fields
     const result = await pool.query(
       `INSERT INTO loans (
-        customer_name, customer_number, email,
-        loan_amount, interest_rate, interest_amount, total_payable_amount,
+        first_name, last_name, email, home_phone, mobile_phone, birthdate,
+        referral, identification_info, address,
+        customer_number, loan_amount, interest_rate, interest_amount, total_payable_amount,
         collateral_description, customer_note, transaction_number,
         loan_issued_date, loan_term, due_date,
-        status, remaining_balance, created_by
+        status, remaining_balance, created_by, customer_name
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'active', $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'active', $21, $22, $23)
       RETURNING *`,
       [
-        customerName,
-        customerNumber,
-        email,
+        first_name,
+        last_name,
+        email || null,
+        home_phone || null,
+        mobile_phone || null,
+        birthdate || null,
+        referral || null,
+        identification_info || null,
+        address || null,
+        customer_number || null,
         totalLoanAmount,
         interestRate,
         interestAmount,
         totalPayableAmount,
-        collateralDescription,
-        customerNote,
-        Math.floor(Math.random() * 1000000000).toString(), // Random transaction number
+        collateral_description || null,
+        customer_note || null,
+        Math.floor(Math.random() * 1000000000).toString(),
         loanIssuedDate,
         loanTerm,
         due.toISOString().slice(0, 10),
         totalPayableAmount,
-        userId || null, // Track which user created this loan
+        `${first_name} ${last_name}`, // Backward compatibility
+        userId || null,
       ]
     );
 
-    res.status(201).json({ message: 'Loan created successfully', loan: result.rows[0] });
+    const loan = validators.formatLoanResponse(result.rows[0]);
+
+    res.status(201).json({ 
+      message: 'Loan created successfully', 
+      loan 
+    });
   } catch (err) {
     console.error('Error creating loan:', err);
-    res.status(500).json({ message: 'Error creating loan' });
+    res.status(500).json({ message: 'Error creating loan', error: err.message });
   }
 });
 
@@ -353,49 +405,89 @@ app.post('/create-loan', async (req, res) => {
 
 // ---------------------------- SEARCH LOAN ----------------------------
 app.get('/search-loan', async (req, res) => {
-  const { customerName, customerNumber, email, transactionNumber } = req.query;
-  
   try {
-    // Start with a base query
+    // Accept both camelCase and snake_case query parameters
+    const firstName = req.query.firstName || req.query.first_name;
+    const lastName = req.query.lastName || req.query.last_name;
+    const customerNumber = req.query.customerNumber || req.query.customer_number;
+    const email = req.query.email;
+    const transactionNumber = req.query.transactionNumber || req.query.transaction_number;
+    const mobilePhone = req.query.mobilePhone || req.query.mobile_phone;
+    const customerName = req.query.customerName || req.query.customer_name;
+
+    // Build dynamic query
     let query = 'SELECT * FROM loans WHERE 1=1';
     const params = [];
+    let paramIndex = 1;
 
-    // Add customerName filter if provided
-    if (customerName) {
-      params.push(`%${customerName}%`);
-      query += ` AND customer_name ILIKE $${params.length}`;
+    // Search by first name
+    if (firstName) {
+      params.push(`%${firstName}%`);
+      query += ` AND first_name ILIKE $${paramIndex}`;
+      paramIndex++;
     }
 
-    // Add customerNumber filter if provided
+    // Search by last name
+    if (lastName) {
+      params.push(`%${lastName}%`);
+      query += ` AND last_name ILIKE $${paramIndex}`;
+      paramIndex++;
+    }
+
+    // Search by customer number
     if (customerNumber) {
       params.push(`%${customerNumber}%`);
-      query += ` AND customer_number ILIKE $${params.length}`;
+      query += ` AND customer_number ILIKE $${paramIndex}`;
+      paramIndex++;
     }
 
-    // Add email filter if provided
+    // Search by email
     if (email) {
       params.push(`%${email}%`);
-      query += ` AND email ILIKE $${params.length}`;
+      query += ` AND email ILIKE $${paramIndex}`;
+      paramIndex++;
     }
 
-    // Add transactionNumber filter if provided
+    // Search by transaction number
     if (transactionNumber) {
       params.push(transactionNumber);
-      query += ` AND transaction_number = $${params.length}`;
+      query += ` AND transaction_number = $${paramIndex}`;
+      paramIndex++;
     }
 
-    // Execute the query
+    // Search by mobile phone
+    if (mobilePhone) {
+      params.push(`%${mobilePhone}%`);
+      query += ` AND mobile_phone ILIKE $${paramIndex}`;
+      paramIndex++;
+    }
+
+    // Fallback: search by full customer_name (backward compatibility)
+    if (customerName && !firstName && !lastName) {
+      params.push(`%${customerName}%`);
+      query += ` AND (customer_name ILIKE $${paramIndex} OR CONCAT(first_name, ' ', last_name) ILIKE $${paramIndex})`;
+      paramIndex++;
+    }
+
+    // If no search criteria provided, return error
+    if (params.length === 0) {
+      return res.status(400).json({ message: 'At least one search criteria is required' });
+    }
+
+    // Execute query
     const result = await pool.query(query, params);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ message: 'No loans found' });
     }
 
-    // Return multiple loans if found
-    res.json(result.rows);
+    // Format response with snake_case fields
+    const formattedLoans = result.rows.map(loan => validators.formatLoanResponse(loan));
+
+    res.json(formattedLoans);
   } catch (err) {
     console.error('Error searching loans:', err);
-    res.status(500).json({ message: 'Error searching loans' });
+    res.status(500).json({ message: 'Error searching loans', error: err.message });
   }
 });
 
